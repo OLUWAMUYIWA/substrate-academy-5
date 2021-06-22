@@ -3,10 +3,11 @@
 use codec::{Encode, Decode};
 use frame_support::{
 	decl_module, decl_storage, decl_event, decl_error, ensure, StorageValue, StorageDoubleMap, Parameter,
-	traits::Randomness, RuntimeDebug, dispatch::{DispatchError, DispatchResult},
+	traits::Randomness, RuntimeDebug, dispatch::{DispatchError, DispatchResult}, fail
 };
 use sp_io::hashing::blake2_128;
 use frame_system::ensure_signed;
+use frame_support::traits::{Currency};
 use sp_runtime::traits::{AtLeast32BitUnsigned, Bounded, One, CheckedAdd};
 
 #[cfg(test)]
@@ -35,7 +36,12 @@ pub trait Config: frame_system::Config {
 	type Event: From<Event<Self>> + Into<<Self as frame_system::Config>::Event>;
 	type Randomness: Randomness<Self::Hash>;
 	type KittyIndex: Parameter + AtLeast32BitUnsigned + Bounded + Default + Copy;
+	type Currency: Currency<Self::AccountId>;
 }
+
+type KittyIndexOf<T> = <T as Config>::KittyIndex;
+type AccountIdOf<T> = <T as frame_system::Config>::AccountId;
+type BalanceOf<T> = <<T as Config>::Currency as Currency<AccountIdOf<T>>>::Balance;
 
 decl_storage! {
 	trait Store for Module<T: Config> as Kitties {
@@ -43,6 +49,10 @@ decl_storage! {
 		pub Kitties get(fn kitties): double_map hasher(blake2_128_concat) T::AccountId, hasher(blake2_128_concat) T::KittyIndex => Option<Kitty>;
 		/// Stores the next kitty ID
 		pub NextKittyId get(fn next_kitty_id): T::KittyIndex;
+		//Kitty prices are set as options against KittyId  because a price may not be set for a kitty, meeaning that it is not up for sale
+		pub KittyPrice get(fn kitty_price): map hasher(blake2_128_concat) KittyIndexOf<T> => Option<BalanceOf<T>>;
+
+		pub Balance get(fn balance): map hasher(blake2_128_concat) T::AccountId => Option<BalanceOf<T>>;
 	}
 }
 
@@ -50,6 +60,7 @@ decl_event! {
 	pub enum Event<T> where
 		<T as frame_system::Config>::AccountId,
 		<T as Config>::KittyIndex,
+		Balance = BalanceOf<T>,
 	{
 		/// A kitty is created. \[owner, kitty_id, kitty\]
 		KittyCreated(AccountId, KittyIndex, Kitty),
@@ -57,6 +68,9 @@ decl_event! {
 		KittyBred(AccountId, KittyIndex, Kitty),
 		/// A kitty is transferred. \[from, to, kitty_id\]
 		KittyTransferred(AccountId, AccountId, KittyIndex),
+		KittyPriceSet(KittyIndex, Balance),
+		KittyPrice(KittyIndex, Balance),
+		KittyExchanged(KittyIndex, AccountId, AccountId),
 	}
 }
 
@@ -65,6 +79,9 @@ decl_error! {
 		KittiesIdOverflow,
 		InvalidKittyId,
 		SameGender,
+		NotForSale,
+		CannotExchangeWithYourself,
+		NotEnoughBalance
 	}
 }
 
@@ -140,14 +157,65 @@ decl_module! {
 				Ok(())
 			})?;
 		}
-	}
+		#[weight = 2000]
+		pub fn set_price(origin, kitty_id: KittyIndexOf<T>, new_price: BalanceOf<T>) -> DispatchResult {
+			let setter = ensure_signed(origin)?;
+			let is_mine = Kitties::<T>::contains_key(&setter, &kitty_id);
+			ensure!(is_mine, Error::<T>::InvalidKittyId);
+			let price = KittyPrice::<T>::get(kitty_id).ok_or(Error::<T>::NotForSale)?;
+			KittyPrice::<T>::mutate_exists(kitty_id, |price| {*price = Some(new_price)});
+			Self::deposit_event(RawEvent::KittyPriceSet(kitty_id, price));
+			Ok(())
+		}
+
+		#[weight = 2000]
+		pub fn exchange(origin, receiver: T::AccountId, kitty_id: KittyIndexOf<T>) -> DispatchResult {
+			let sender = ensure_signed(origin)?;
+			//first we ensure that the sender is not the receiver
+			ensure!(sender != receiver, Error::<T>::CannotExchangeWithYourself);
+			// then we get the sender's balance so that we an chck if they have the reqd amunt
+			let my_balance = Balance::<T>::get(&receiver);
+			//is the kitty for sale?
+			let price = KittyPrice::<T>::take(kitty_id).ok_or(Error::<T>::NotForSale)?;
+			if let Some(money) = my_balance  {
+					if price < money {
+						//let _new_bal = money - price;
+						Balance::<T>::mutate_exists(&sender, |bal| {
+							if let Some(my_bal) = bal {
+								let new_bal = *my_bal - price;
+								*bal = Some(new_bal);
+							}
+							
+						});
+						Balance::<T>::mutate_exists(&receiver, |bal| {
+							if let Some(my_bal) = bal {
+								let new_bal = *my_bal + price;
+								*bal = Some(new_bal);
+							}
+						});
+						Kitties::<T>::take(&sender, &kitty_id).unwrap();
+						Self::deposit_event(RawEvent::KittyExchanged(kitty_id, sender, receiver));
+					} else {
+						// throw an erorr
+						fail!(Error::<T>::NotEnoughBalance);	
+					}
+					Ok(())
+			} else {
+				fail!(Error::<T>::NotForSale);
+			}
+
+			}
+		}
+	
 }
+
 
 fn combine_dna(dna1: u8, dna2: u8, selector: u8) -> u8 {
 	(!selector & dna1) | (selector & dna2)
 }
 
 impl<T: Config> Module<T> {
+
 	fn get_next_kitty_id() -> sp_std::result::Result<T::KittyIndex, DispatchError> {
 		NextKittyId::<T>::try_mutate(|next_id| -> sp_std::result::Result<T::KittyIndex, DispatchError> {
 			let current_id = *next_id;
