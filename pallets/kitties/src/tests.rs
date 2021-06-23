@@ -86,6 +86,13 @@ fn last_event() -> Event {
     System::events().last().unwrap().event.clone()
 }
 
+// #[test]
+// fn can_set_price() {
+//     new_test_ext().execute_with(|| {
+//         assert_ok(1,1);
+//     })
+// }
+
 #[test]
 fn can_create() {
     new_test_ext().execute_with(|| {
